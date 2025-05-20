@@ -1,7 +1,12 @@
 # Base image
-FROM python:3.9-slim
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
-# Install system dependencies, build tools, and libraries
+# Set environment variables for NVIDIA and PyTorch
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
+
+# Install system dependencies, including FFmpeg
+# The base image should have most build tools. We'll add specific ones if needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
@@ -9,11 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     fonts-liberation \
     fontconfig \
+    python3-pip \
+    git \
     build-essential \
+    pkg-config \
+    # FFmpeg build dependencies (subset from original, plus CUDA related)
     yasm \
-    cmake \
-    meson \
-    ninja-build \
     nasm \
     libssl-dev \
     libvpx-dev \
@@ -30,93 +36,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgnutls28-dev \
     libaom-dev \
     libdav1d-dev \
-    librav1e-dev \
-    libsvtav1-dev \
+    # librav1e-dev and libsvtav1-dev might require rust/newer meson, keeping them out for now to simplify
     libzimg-dev \
     libwebp-dev \
-    git \
-    pkg-config \
     autoconf \
     automake \
     libtool \
     libfribidi-dev \
     libharfbuzz-dev \
+    # Add any other essential packages that might be missing and are not for compiling from source
     && rm -rf /var/lib/apt/lists/*
 
-# Install SRT from source (latest version using cmake)
-RUN git clone https://github.com/Haivision/srt.git && \
-    cd srt && \
-    mkdir build && cd build && \
-    cmake .. && \
-    make -j$(nproc) && \
-    make install && \
-    cd ../.. && rm -rf srt
-
-# Install SVT-AV1 from source
-RUN git clone https://gitlab.com/AOMediaCodec/SVT-AV1.git && \
-    cd SVT-AV1 && \
-    git checkout v0.9.0 && \
-    cd Build && \
-    cmake .. && \
-    make -j$(nproc) && \
-    make install && \
-    cd ../.. && rm -rf SVT-AV1
-
-# Install libvmaf from source
-RUN git clone https://github.com/Netflix/vmaf.git && \
-    cd vmaf/libvmaf && \
-    meson build --buildtype release && \
-    ninja -C build && \
-    ninja -C build install && \
-    cd ../.. && rm -rf vmaf && \
-    ldconfig  # Update the dynamic linker cache
-
-# Manually build and install fdk-aac (since it is not available via apt-get)
-RUN git clone https://github.com/mstorsjo/fdk-aac && \
-    cd fdk-aac && \
-    autoreconf -fiv && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    cd .. && rm -rf fdk-aac
-
-# Install libunibreak (required for ASS_FEATURE_WRAP_UNICODE)
-RUN git clone https://github.com/adah1972/libunibreak.git && \
-    cd libunibreak && \
-    ./autogen.sh && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    cd .. && rm -rf libunibreak
-
-# Build and install libass with libunibreak support and ASS_FEATURE_WRAP_UNICODE enabled
-RUN git clone https://github.com/libass/libass.git && \
-    cd libass && \
-    autoreconf -i && \
-    ./configure --enable-libunibreak || { cat config.log; exit 1; } && \
-    mkdir -p /app && echo "Config log located at: /app/config.log" && cp config.log /app/config.log && \
-    make -j$(nproc) || { echo "Libass build failed"; exit 1; } && \
-    make install && \
-    ldconfig && \
-    cd .. && rm -rf libass
-
-# Build and install FFmpeg with all required features
+# Build and install FFmpeg with NVIDIA GPU support and other required features
 RUN git clone https://git.ffmpeg.org/ffmpeg.git ffmpeg && \
     cd ffmpeg && \
     git checkout n7.0.2 && \
-    PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig" \
-    CFLAGS="-I/usr/include/freetype2" \
-    LDFLAGS="-L/usr/lib/x86_64-linux-gnu" \
+    # PKG_CONFIG_PATH might need /usr/local/cuda/lib64/pkgconfig if CUDA libs provide .pc files
+    # However, --extra-cflags and --extra-ldflags are more direct for CUDA.
     ./configure --prefix=/usr/local \
         --enable-gpl \
+        --enable-nonfree \
         --enable-pthreads \
-        --enable-neon \
+        # CUDA specific flags
+        --enable-nvenc \
+        --enable-nvdec \
+        --enable-cuda-llvm \
+        --enable-cuvid \
+        --enable-cuda \
+        --extra-cflags="-I/usr/local/cuda/include" \
+        --extra-ldflags="-L/usr/local/cuda/lib64" \
+        # Existing codec and feature flags (adjusted)
         --enable-libaom \
         --enable-libdav1d \
-        --enable-librav1e \
-        --enable-libsvtav1 \
-        --enable-libvmaf \
         --enable-libzimg \
         --enable-libx264 \
         --enable-libx265 \
@@ -131,17 +82,13 @@ RUN git clone https://git.ffmpeg.org/ffmpeg.git ffmpeg && \
         --enable-libfreetype \
         --enable-libharfbuzz \
         --enable-fontconfig \
-        --enable-libsrt \
-        --enable-filter=drawtext \
-        --extra-cflags="-I/usr/include/freetype2 -I/usr/include/libpng16 -I/usr/include" \
-        --extra-ldflags="-L/usr/lib/x86_64-linux-gnu -lfreetype -lfontconfig" \
         --enable-gnutls \
+        # --enable-libsrt # srt-gnutls-dev package would be needed
+        --enable-filter=drawtext \
     && make -j$(nproc) && \
     make install && \
-    cd .. && rm -rf ffmpeg
-
-# Add /usr/local/bin to PATH (if not already included)
-ENV PATH="/usr/local/bin:${PATH}"
+    cd .. && rm -rf ffmpeg && \
+    ldconfig # Refresh shared library cache
 
 # Copy fonts into the custom fonts directory
 COPY ./fonts /usr/share/fonts/custom
